@@ -1,0 +1,141 @@
+---
+- name: Set up Kubernetes cluster using kubeadm
+  hosts: all
+  become: yes
+  vars:
+    k8s_version: "1.33"
+    pod_network_cidr: "192.168.0.0/16"
+    calico_version: "v3.29.2"
+    master_node: "{{ groups['master'] | first }}"
+
+  tasks:
+    - name: Update and upgrade packages
+      apt:
+        update_cache: yes
+        upgrade: dist
+
+    - name: Install required system packages
+      apt:
+        name:
+          - apt-transport-https
+          - ca-certificates
+          - curl
+          - containerd
+        state: present
+
+    - name: Disable swap
+      shell: |
+        swapoff -a
+        sed -i '/ swap / s/^/#/' /etc/fstab
+      args:
+        executable: /bin/bash
+
+    - name: Configure kernel parameters
+      block:
+        - name: Create modules-load.d config
+          copy:
+            dest: /etc/modules-load.d/k8s.conf
+            content: |
+              overlay
+              br_netfilter
+
+        - name: Load kernel modules
+          command: modprobe {{ item }}
+          loop:
+            - overlay
+            - br_netfilter
+
+        - name: Create sysctl config
+          copy:
+            dest: /etc/sysctl.d/k8s.conf
+            content: |
+              net.bridge.bridge-nf-call-iptables  = 1
+              net.bridge.bridge-nf-call-ip6tables = 1
+              net.ipv4.ip_forward                 = 1
+
+        - name: Apply sysctl settings
+          command: sysctl --system
+
+    - name: Configure containerd
+      block:
+        - name: Create containerd config directory
+          file:
+            path: /etc/containerd
+            state: directory
+
+        - name: Generate default containerd config
+          command: containerd config default
+          register: containerd_config
+
+        - name: Save containerd config
+          copy:
+            dest: /etc/containerd/config.toml
+            content: "{{ containerd_config.stdout | regex_replace('SystemdCgroup = false', 'SystemdCgroup = true') }}"
+
+        - name: Restart and enable containerd
+          systemd:
+            name: containerd
+            state: restarted
+            enabled: yes
+
+    - name: Add Kubernetes APT repository
+      apt_repository:
+        repo: "deb https://pkgs.k8s.io/core:/stable:/v{{ k8s_version }}/deb/ /"
+        state: present
+        filename: kubernetes
+        key: "https://pkgs.k8s.io/core:/stable:/v{{ k8s_version }}/deb/Release.key"
+
+    - name: Install Kubernetes components
+      apt:
+        name:
+          - kubelet
+          - kubeadm
+          - kubectl
+        state: present
+        update_cache: yes
+
+    - name: Prevent automatic updates of Kubernetes packages
+      command: apt-mark hold kubelet kubeadm kubectl
+
+- name: Initialize Kubernetes cluster on master node
+  hosts: master
+  become: yes
+  tasks:
+    - name: Initialize Kubernetes cluster
+      command: kubeadm init --pod-network-cidr={{ pod_network_cidr }}
+      register: kubeadm_init
+
+    - name: Save join command
+      set_fact:
+        join_command: "{{ kubeadm_init.stdout | regex_search('kubeadm join.*') }}"
+
+    - name: Configure kubectl for current user
+      block:
+        - name: Create .kube directory
+          file:
+            path: $HOME/.kube
+            state: directory
+            mode: '0755'
+
+        - name: Copy admin config
+          command: cp -i /etc/kubernetes/admin.conf $HOME/.kube/config
+          args:
+            creates: $HOME/.kube/config
+
+        - name: Change ownership of kube config
+          file:
+            path: $HOME/.kube/config
+            owner: "{{ ansible_user_id }}"
+            group: "{{ ansible_user_id }}"
+
+    - name: Install Calico network plugin
+      command: kubectl apply -f https://raw.githubusercontent.com/projectcalico/calico/{{ calico_version }}/manifests/calico.yaml
+
+    - name: Get nodes
+      command: kubectl get nodes
+      register: nodes
+      changed_when: false
+
+    - name: Show nodes
+      debug:
+        var: nodes.stdout_lines
